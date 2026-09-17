@@ -18,11 +18,10 @@ def rotmat_to_rot6d(mat):
     return mat[..., :2, :].reshape(*mat.shape[:-2], 6)
 
 
-def integrate_deltas(deltas, init):
-    return deltas.cumsum(dim=1) + init.unsqueeze(1)
+def project_rot6d(rot6d):
+    return rotmat_to_rot6d(rot6d_to_rotmat(rot6d))
 
 
-# SMPL skeleton connectivity for masking
 def build_skeleton_mask(nj):
     mask = torch.full((nj, nj), float("-inf"))
     edges = [
@@ -64,7 +63,6 @@ class TemporalAttn(nn.Module):
         self.nhead = nhead
         self.head_dim = dim // nhead
         
-        # per-joint learned projections
         self.joint_q_projs = nn.Parameter(torch.randn(nj, dim, dim))
         self.joint_k_projs = nn.Parameter(torch.randn(nj, dim, dim))
         self.joint_v_projs = nn.Parameter(torch.randn(nj, dim, dim))
@@ -83,7 +81,6 @@ class TemporalAttn(nn.Module):
         k = torch.einsum('btjd,jde->btje', x, self.joint_k_projs)
         v = torch.einsum('btjd,jde->btje', x, self.joint_v_projs)
         
-        # reshape for multi-head
         q = q.view(bs, seqlen, nj, nh, hd).permute(0, 2, 3, 1, 4).reshape(bs * nj * nh, seqlen, hd)
         k = k.view(bs, seqlen, nj, nh, hd).permute(0, 2, 3, 1, 4).reshape(bs * nj * nh, seqlen, hd)
         v = v.view(bs, seqlen, nj, nh, hd).permute(0, 2, 3, 1, 4).reshape(bs * nj * nh, seqlen, hd)
@@ -171,7 +168,6 @@ class STTransformer(nn.Module):
         self.in_frames = in_frames
         self.nj = nj
         
-        # embedding layers
         self.joint_embed_w = nn.Parameter(torch.randn(nj, 6, dim))
         self.joint_embed_b = nn.Parameter(torch.zeros(nj, dim))
         nn.init.xavier_uniform_(self.joint_embed_w)
@@ -185,7 +181,6 @@ class STTransformer(nn.Module):
             for _ in range(nlayers)
         ])
 
-        # decoder heads
         self.joint_head_w1 = nn.Parameter(torch.randn(nj, dim, dff))
         self.joint_head_b1 = nn.Parameter(torch.zeros(nj, dff))
         self.joint_head_w2 = nn.Parameter(torch.randn(nj, dff, 6))
@@ -201,7 +196,6 @@ class STTransformer(nn.Module):
         )
 
     def embed(self, pose, root):
-        B, T, J = pose.shape[:3]
         pose_emb = torch.einsum('btjc,jcd->btjd', pose, self.joint_embed_w) + self.joint_embed_b
         root_emb = self.root_embed(root).unsqueeze(2)
         emb = pose_emb + root_emb
@@ -214,15 +208,13 @@ class STTransformer(nn.Module):
 
     def predict_next(self, pose, root):
         x = self.encode(self.embed(pose, root))
-        h = x[:, -1]  # last timestep
+        h = x[:, -1]  
         
-        # decode pose
         hidden = torch.einsum('bjd,jdf->bjf', h, self.joint_head_w1) + self.joint_head_b1
         hidden = F.relu(hidden)
         pose_delta = torch.einsum('bjf,jfc->bjc', hidden, self.joint_head_w2) + self.joint_head_b2
-        next_pose = F.normalize(pose[:, -1] + pose_delta, dim=-1)
+        next_pose = project_rot6d(pose[:, -1] + pose_delta)
         
-        # decode root
         root_delta = self.root_head(h.mean(1))
         next_root = root[:, -1] + root_delta
         
