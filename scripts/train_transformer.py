@@ -10,108 +10,55 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent.parent))
 
-from data_loader import AMASSForecastDataset, collate_fn
+from scripts.data_loader import AMASSForecastDataset, collate_fn
+from scripts.skeleton import forward_kinematics, rest_to_offsets
+from scripts.train_utils import get_lr_schedule, make_optimizer, describe
 from models.transformer import STTransformer, rot6d_to_rotmat, rotmat_to_rot6d
 
-
-SMPL_PARENTS = [
-    -1,  
-    0, 0, 0,  
-    1, 2, 3,  
-    4, 5, 6, 
-    7, 8, 9,  
-    9, 9,     
-    12,       
-    13, 14,   
-    16, 17,   
-    18, 19,   
-]
-
-BONE_LENS = torch.tensor([
-    0.0,    
-    0.1, 0.1, 0.1,
-    0.4, 0.4, 0.15,
-    0.4, 0.4, 0.15,
-    0.05, 0.05, 0.15,
-    0.1, 0.1,
-    0.1,
-    0.15, 0.15,
-    0.25, 0.25,
-    0.2, 0.2,
-], dtype=torch.float32)
-
-
-def fk(rotmats, root_pos, parents=SMPL_PARENTS, bone_lens=BONE_LENS):
-    B, T, J = rotmats.shape[:3]
-    dev = rotmats.device
-    
-    pos = torch.zeros(B, T, J, 3, device=dev)
-    glob_rot = torch.zeros(B, T, J, 3, 3, device=dev)
-    
-    pos[:, :, 0, :] = root_pos
-    glob_rot[:, :, 0] = rotmats[:, :, 0]
-    
-    bone_lens = bone_lens.to(dev)
-    
-    for j in range(1, J):
-        p = parents[j]
-        if p >= 0:
-            glob_rot[:, :, j] = glob_rot[:, :, p] @ rotmats[:, :, j]
-            bone_vec = torch.tensor([0, bone_lens[j], 0], device=dev)
-            bone_world = (glob_rot[:, :, p] @ bone_vec.unsqueeze(-1)).squeeze(-1)
-            pos[:, :, j, :] = pos[:, :, p, :] + bone_world
-    
-    return pos
-
+fk = forward_kinematics
 
 cfg = {
     "input_frames": 25,
-    "output_frames": 5, 
+    "output_frames": 5,
     "num_joints": 22,
+    "fps": 25,               
     "stride_train": 10,
     "stride_val": 10,
+
+    "batch_size": 24,
+    "epochs": 20,
+    "lr": 3e-4,              
+    "warmup_epochs": 2,
+    "weight_decay": 1e-4,
+    "adam_betas": (0.9, 0.98),
+    "adam_eps": 1e-9,
+    "grad_clip": 1.0,
+    "dropout": 0.1,
+
+    "val_every": 2,
+    "val_batches": 60,
+    "val_gt_root": False,
 
     "d_model": 128,
     "num_layers": 8,
     "num_heads": 8,
     "dim_feedforward": 256,
-    "dropout": 0.1,
 
-    "batch_size": 24, 
-    "lr": 1e-4,
-    "epochs": 20, 
-    "warmup_epochs": 2, 
-    "weight_decay": 1e-4,
-    
     "sched_sampling": True,
     "ss_start": 6,
-    "ss_ramp": 8,    
+    "ss_ramp": 8,
     "ss_min": 0.1,
 
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "grad_ckpt": True,
+
     "ckpt_dir": "checkpoints/st_transformer",
     "save_every": 10,
-    "val_every": 2,
-    "val_batches": 5,
+
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
     "amp": True,
-    "workers": 2, 
+    "workers": 2,
     "pin_mem": True,
-    "grad_ckpt": True,
-    
-    "val_gt_root": False,
 }
-
-
-def get_lr_schedule(opt, warmup, total):
-    dim = cfg["d_model"]
-    
-    def lr_fn(step):
-        step = max(1, step)
-        a = step ** -0.5
-        b = step * (warmup ** -1.5)
-        return (dim ** -0.5) * min(a, b)
-    
-    return torch.optim.lr_scheduler.LambdaLR(opt, lr_fn)
 
 
 def prep_batch(batch, dev):
@@ -128,8 +75,10 @@ def prep_batch(batch, dev):
     
     past_6d = rotmat_to_rot6d(past_3x3)
     fut_6d = rotmat_to_rot6d(fut_3x3)
-    
-    return past_6d, fut_6d, past_r, fut_r, past_3x3, fut_3x3
+
+    offsets = rest_to_offsets(batch["rest_joints"].to(dev, non_blocking=True))
+
+    return past_6d, fut_6d, past_r, fut_r, past_3x3, fut_3x3, offsets
 
 
 def train_epoch(model, loader, opt, sched, scaler, dev, ep):
@@ -144,7 +93,7 @@ def train_epoch(model, loader, opt, sched, scaler, dev, ep):
 
     pbar = tqdm(loader, desc=f"Epoch {ep} [TF={tf_prob:.2f}]")
     for batch in pbar:
-        past_6d, fut_6d, past_r, fut_r, _, _ = prep_batch(batch, dev)
+        past_6d, fut_6d, past_r, fut_r, _, _, _ = prep_batch(batch, dev)
         
         B, T_in, J = past_6d.shape[:3]
         T_out = fut_6d.shape[1]
@@ -171,14 +120,14 @@ def train_epoch(model, loader, opt, sched, scaler, dev, ep):
                 next_p = torch.where(use_gt[:, None, None], tgt_p, pred_p.detach())
                 next_r = torch.where(use_gt[:, None], tgt_r, pred_r.detach())
                 
-                inp_p = torch.cat([inp_p, next_p.unsqueeze(1)], dim=1)
-                inp_r = torch.cat([inp_r, next_r.unsqueeze(1)], dim=1)
+                inp_p = torch.cat([inp_p[:, 1:], next_p.unsqueeze(1)], dim=1)
+                inp_r = torch.cat([inp_r[:, 1:], next_r.unsqueeze(1)], dim=1)
             
             loss = torch.stack(losses).mean()
         
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
         scaler.step(opt)
         scaler.update()
         
@@ -199,34 +148,35 @@ def validate(model, loader, dev, max_b=20):
     gt_root = cfg["val_gt_root"]
     metric = "Pose-only MPJPE" if gt_root else "Full motion MPJPE"
     
-    for i, batch in enumerate(tqdm(loader, desc=f"Val [{metric}]", total=max_b)):
-        if i >= max_b:
+    n_batches = max_b if max_b and max_b > 0 else len(loader)
+
+    for i, batch in enumerate(tqdm(loader, desc=f"Val [{metric}]", total=n_batches)):
+        if i >= n_batches:
             break
-        
-        past_6d, fut_6d, past_r, fut_r, _, fut_3x3 = prep_batch(batch, dev)
-        
-        B, T_in, J = past_6d.shape[:3]
+
+        past_6d, fut_6d, past_r, fut_r, _, fut_3x3, offsets = prep_batch(batch, dev)
         T_out = fut_6d.shape[1]
-        
+
         pred_6d, pred_r = model.forward(past_6d, past_r, T_out)
         pred_3x3 = rot6d_to_rotmat(pred_6d)
-        
-        if gt_root:
-            pred_pos = fk(pred_3x3, fut_r)
-            gt_pos = fk(fut_3x3, fut_r)
-        else:
-            pred_pos = fk(pred_3x3, pred_r)
-            gt_pos = fk(fut_3x3, fut_r)
-        
-        mpjpe = torch.norm(pred_pos - gt_pos, dim=-1).mean() * 1000
-        mpjpe_vals.append(mpjpe.item())
-        
-        fde = torch.norm(pred_pos[:, -1] - gt_pos[:, -1], dim=-1).mean() * 1000
-        fde_vals.append(fde.item())
-    
+
+        root_for_pred = fut_r if gt_root else pred_r
+        pred_pos = fk(pred_3x3, root_for_pred, offsets)
+        gt_pos = fk(fut_3x3, fut_r, offsets)
+
+        err = torch.norm(pred_pos - gt_pos, dim=-1).mean(dim=(0, 2)) * 1000
+        mpjpe_vals.append(err.cpu().numpy())
+
+    per_frame = np.stack(mpjpe_vals).mean(axis=0)
+    fps = cfg["fps"]
+
     return {
-        "mpjpe": float(np.mean(mpjpe_vals)),
-        "fde": float(np.mean(fde_vals)),
+        "mpjpe": float(per_frame.mean()),
+        "fde": float(per_frame[-1]),
+        "per_horizon": {
+            f"{int(round((t + 1) * 1000 / fps))}ms": float(per_frame[t])
+            for t in range(per_frame.shape[0])
+        },
         "type": metric,
     }
 
@@ -273,11 +223,9 @@ def main():
         grad_ckpt=cfg["grad_ckpt"],
     ).to(dev)
     
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=cfg["lr"],
-        weight_decay=cfg["weight_decay"],
-        betas=(0.9, 0.98), eps=1e-9,
-    )
+    print(describe(cfg, "ST-Transformer"))
+
+    opt = make_optimizer(model, cfg)
     
     steps_per_ep = len(train_loader)
     total_steps = steps_per_ep * cfg["epochs"]
@@ -304,6 +252,7 @@ def main():
         if ep % cfg["val_every"] == 0 or ep == cfg["epochs"]:
             metrics = validate(model, val_loader, dev, cfg["val_batches"])
             print(f"{metrics['type']}: {metrics['mpjpe']:.2f}mm | FDE: {metrics['fde']:.2f}mm")
+            print("  " + "  ".join(f"{k} {v:.1f}" for k, v in metrics["per_horizon"].items()))
             
             if metrics["mpjpe"] < best:
                 best = metrics["mpjpe"]
