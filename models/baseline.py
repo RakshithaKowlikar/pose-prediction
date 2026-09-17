@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.transformer import project_rot6d
+
 
 class PoseGRU(nn.Module):
 
@@ -59,7 +61,7 @@ class PoseGRU(nn.Module):
         future_pose = future_pose.view(
             B, self.output_frames, J, 6
         )
-        future_pose = F.normalize(future_pose, dim=-1)
+        future_pose = project_rot6d(future_pose)
 
         future_root = self.root_decoder(h)
         future_root = future_root.view(
