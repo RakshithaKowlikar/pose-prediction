@@ -10,83 +10,42 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).parent.parent))
 
 from scripts.data_loader import AMASSForecastDataset, collate_fn
+from scripts.skeleton import forward_kinematics, rest_to_offsets
+from scripts.train_utils import get_lr_schedule, make_optimizer, describe
 from models.baseline import PoseGRU
 from models.transformer import rot6d_to_rotmat, rotmat_to_rot6d
-
-
-SMPL_PARENTS = [
-    -1, 0, 0, 0,
-    1, 2, 3,
-    4, 5, 6,
-    7, 8, 9,
-    9, 9,
-    12,
-    13, 14,
-    16, 17,
-    18, 19,
-]
-
-BONE_LENGTHS = torch.tensor([
-    0.0,
-    0.1, 0.1, 0.1,
-    0.4, 0.4, 0.15,
-    0.4, 0.4, 0.15,
-    0.05, 0.05, 0.15,
-    0.1, 0.1,
-    0.1,
-    0.15, 0.15,
-    0.25, 0.25,
-    0.2, 0.2,
-], dtype=torch.float32)
-
-
-def forward_kinematics(rotmats, root_pos):
-    B, T, J, _, _ = rotmats.shape
-    device = rotmats.device
-
-    positions = torch.zeros(B, T, J, 3, device=device)
-    global_rot = torch.zeros(B, T, J, 3, 3, device=device)
-
-    positions[:, :, 0] = root_pos
-    global_rot[:, :, 0] = rotmats[:, :, 0]
-
-    bone_lengths = BONE_LENGTHS.to(device)
-
-    for j in range(1, J):
-        p = SMPL_PARENTS[j]
-        global_rot[:, :, j] = global_rot[:, :, p] @ rotmats[:, :, j]
-        bone = torch.tensor([0, bone_lengths[j], 0], device=device)
-        bone_world = global_rot[:, :, p] @ bone
-        positions[:, :, j] = positions[:, :, p] + bone_world
-
-    return positions
 
 
 CONFIG = {
     "input_frames": 25,
     "output_frames": 5,
     "num_joints": 22,
+    "fps": 25,               
     "stride_train": 10,
     "stride_val": 10,
 
-    "hidden_dim": 256,
-    "num_layers": 2,
+    "batch_size": 24,
+    "epochs": 20,
+    "lr": 3e-4,              
+    "warmup_epochs": 2,
+    "weight_decay": 1e-4,
+    "adam_betas": (0.9, 0.98),
+    "adam_eps": 1e-9,
+    "grad_clip": 1.0,
     "dropout": 0.1,
 
-    "batch_size": 24,
-    "learning_rate": 1e-4,
-    "num_epochs": 20,
-    "weight_decay": 1e-4,
+    "val_every": 2,
+    "val_batches": 60,
+    "val_gt_root": False,
+
+    "hidden_dim": 256,
+    "num_layers": 2,
+    "checkpoint_dir": "checkpoints/baseline_gru",
 
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "checkpoint_dir": "checkpoints/baseline_gru",
-    "validate_every": 2,
-    "val_max_batches": 5,
-    "mixed_precision": True,
-    "num_workers": 2,
-    "pin_memory": True,
-
-    "val_use_gt_root": False,
+    "amp": True,
+    "workers": 2,
+    "pin_mem": True,
 }
 
 
@@ -106,19 +65,21 @@ def prepare_batch(batch, device):
         future_pose.view(B, T_out, J, 3, 3)
     )
 
-    return past_pose_6d, future_pose_6d, past_root, future_root
+    offsets = rest_to_offsets(batch["rest_joints"].to(device))
 
-def train_epoch(model, loader, optimizer, scaler, device, epoch):
+    return past_pose_6d, future_pose_6d, past_root, future_root, offsets
+
+def train_epoch(model, loader, optimizer, scheduler, scaler, device, epoch):
     model.train()
     total = 0.0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     for batch in pbar:
-        past_pose, future_pose, past_root, future_root = prepare_batch(batch, device)
+        past_pose, future_pose, past_root, future_root, _ = prepare_batch(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast("cuda", enabled=CONFIG["mixed_precision"]):
+        with torch.amp.autocast("cuda", enabled=CONFIG["amp"]):
             pred_pose, pred_root = model(past_pose, past_root)
             loss = (
                 F.mse_loss(pred_pose, future_pose)
@@ -126,11 +87,16 @@ def train_epoch(model, loader, optimizer, scaler, device, epoch):
             )
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip"])
         scaler.step(optimizer)
         scaler.update()
 
+        if scheduler:
+            scheduler.step()
+
         total += loss.item()
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.6f}")
 
     return total / len(loader)
 
@@ -140,27 +106,37 @@ def validate(model, loader, device):
     model.eval()
     mpjpe_list = []
 
+    max_b = CONFIG["val_batches"]
+    n_batches = max_b if max_b and max_b > 0 else len(loader)
+
     for i, batch in enumerate(loader):
-        if i >= CONFIG["val_max_batches"]:
+        if i >= n_batches:
             break
 
-        past_pose, future_pose, past_root, future_root = prepare_batch(batch, device)
+        past_pose, future_pose, past_root, future_root, offsets = prepare_batch(batch, device)
         pred_pose, pred_root = model(past_pose, past_root)
 
         pred_rot = rot6d_to_rotmat(pred_pose)
         gt_rot = rot6d_to_rotmat(future_pose)
 
-        if CONFIG["val_use_gt_root"]:
-            pred_pos = forward_kinematics(pred_rot, future_root)
-            gt_pos = forward_kinematics(gt_rot, future_root)
-        else:
-            pred_pos = forward_kinematics(pred_rot, pred_root)
-            gt_pos = forward_kinematics(gt_rot, future_root)
+        root_for_pred = future_root if CONFIG["val_gt_root"] else pred_root
+        pred_pos = forward_kinematics(pred_rot, root_for_pred, offsets)
+        gt_pos = forward_kinematics(gt_rot, future_root, offsets)
 
-        mpjpe = torch.norm(pred_pos - gt_pos, dim=-1).mean() * 1000
-        mpjpe_list.append(mpjpe.item())
+        err = torch.norm(pred_pos - gt_pos, dim=-1).mean(dim=(0, 2)) * 1000
+        mpjpe_list.append(err.cpu().numpy())
 
-    return float(np.mean(mpjpe_list))
+    per_frame = np.stack(mpjpe_list).mean(axis=0)
+    fps = CONFIG["fps"]
+
+    return {
+        "mpjpe": float(per_frame.mean()),
+        "fde": float(per_frame[-1]),
+        "per_horizon": {
+            f"{int(round((t + 1) * 1000 / fps))}ms": float(per_frame[t])
+            for t in range(per_frame.shape[0])
+        },
+    }
 
 
 def main():
@@ -187,7 +163,7 @@ def main():
         train_ds,
         batch_size=CONFIG["batch_size"],
         shuffle=True,
-        num_workers=CONFIG["num_workers"],
+        num_workers=CONFIG["workers"],
         collate_fn=collate_fn,
         drop_last=True,
     )
@@ -195,7 +171,7 @@ def main():
         val_ds,
         batch_size=CONFIG["batch_size"],
         shuffle=False,
-        num_workers=CONFIG["num_workers"],
+        num_workers=CONFIG["workers"],
         collate_fn=collate_fn,
     )
 
@@ -208,24 +184,30 @@ def main():
         dropout=CONFIG["dropout"],
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=CONFIG["learning_rate"],
-        weight_decay=CONFIG["weight_decay"],
+    print(describe(CONFIG, "GRU baseline"))
+
+    optimizer = make_optimizer(model, CONFIG)
+
+    steps_per_ep = len(train_loader)
+    scheduler = get_lr_schedule(
+        optimizer,
+        warmup=steps_per_ep * CONFIG["warmup_epochs"],
+        total=steps_per_ep * CONFIG["epochs"],
     )
-    scaler = torch.amp.GradScaler(enabled=CONFIG["mixed_precision"])
+    scaler = torch.amp.GradScaler(enabled=CONFIG["amp"])
 
     best = float("inf")
 
-    for epoch in range(1, CONFIG["num_epochs"] + 1):
-        train_epoch(model, train_loader, optimizer, scaler, device, epoch)
+    for epoch in range(1, CONFIG["epochs"] + 1):
+        train_epoch(model, train_loader, optimizer, scheduler, scaler, device, epoch)
 
-        if epoch % CONFIG["validate_every"] == 0:
-            mpjpe = validate(model, val_loader, device)
-            print(f"Epoch {epoch} | MPJPE: {mpjpe:.2f} mm")
+        if epoch % CONFIG["val_every"] == 0:
+            metrics = validate(model, val_loader, device)
+            print(f"Epoch {epoch} | MPJPE: {metrics['mpjpe']:.2f} mm | FDE: {metrics['fde']:.2f} mm")
+            print("  " + "  ".join(f"{k} {v:.1f}" for k, v in metrics["per_horizon"].items()))
 
-            if mpjpe < best:
-                best = mpjpe
+            if metrics["mpjpe"] < best:
+                best = metrics["mpjpe"]
                 torch.save(model.state_dict(), ckpt_dir / "best_model.pth")
 
     print(f"\nBest GRU MPJPE: {best:.2f} mm")
