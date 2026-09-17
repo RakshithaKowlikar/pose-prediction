@@ -3,11 +3,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import smplx
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
 
 IN_DIR = Path("data/raw")
 OUT_DIR = Path("data/AMASS/npz")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TARGET_FPS = 25
 JOINTS_TO_KEEP = 22
@@ -25,29 +24,45 @@ R_Z_TO_Y = np.array([
 ], dtype=np.float32)
 
 
-def downsample(x, factor):
-    return x[::factor] if factor > 0 else x
+def resample_motion(pose_body, trans, src_fps, tgt_fps):
+    T = pose_body.shape[0]
+    if T < 2 or src_fps == tgt_fps:
+        return pose_body, trans
+
+    if src_fps % tgt_fps == 0:
+        step = src_fps // tgt_fps
+        return pose_body[::step], trans[::step]
+
+    src_t = np.arange(T, dtype=np.float64) / src_fps
+    tgt_t = np.arange(0.0, src_t[-1] + 1e-9, 1.0 / tgt_fps)
+    tgt_t = tgt_t[tgt_t <= src_t[-1]]
+    if tgt_t.size < 2:
+        return pose_body, trans
+
+    trans_out = np.stack(
+        [np.interp(tgt_t, src_t, trans[:, i]) for i in range(trans.shape[1])],
+        axis=1,
+    )
+
+    n_joints = pose_body.shape[1] // 3
+    pose_out = np.empty((tgt_t.size, pose_body.shape[1]), dtype=np.float64)
+    for j in range(n_joints):
+        sl = slice(3 * j, 3 * j + 3)
+        rots = R.from_rotvec(pose_body[:, sl].astype(np.float64))
+        pose_out[:, sl] = Slerp(src_t, rots)(tgt_t).as_rotvec()
+
+    return pose_out.astype(np.float32), trans_out.astype(np.float32)
 
 
 def axis_angle_to_rot_mat(axis_angle):
-    original_shape = axis_angle.shape
-    
-    if axis_angle.ndim == 2 and axis_angle.shape[1] == 3:
-        axis_angle_flat = axis_angle
-    elif axis_angle.ndim == 2:
-        T, dim = axis_angle.shape
-        J = dim // 3
-        axis_angle_flat = axis_angle.reshape(T * J, 3)
-    else:
+    if axis_angle.ndim != 2:
         raise ValueError(f"Unexpected axis_angle shape: {axis_angle.shape}")
-    
-    rotmats = R.from_rotvec(axis_angle_flat).as_matrix()  # (N, 3, 3)
-    
-    if axis_angle.ndim == 2 and axis_angle.shape[1] > 3:
-        T = original_shape[0]
-        J = original_shape[1] // 3
-        rotmats = rotmats.reshape(T, J, 3, 3)
-    
+
+    T, dim = axis_angle.shape
+    rotmats = R.from_rotvec(axis_angle.reshape(-1, 3)).as_matrix()
+    if dim > 3:
+        rotmats = rotmats.reshape(T, dim // 3, 3, 3)
+
     return rotmats.astype(np.float32)
 
 
@@ -124,18 +139,21 @@ def process_file(npz_path: Path):
         gender = data["gender"].item().lower() if "gender" in data else "male"
         fps = int(data["mocap_framerate"].item())
 
-        poses = torch.from_numpy(data["poses"]).float()
-        trans = torch.from_numpy(data["trans"]).float()
-        pose_body = poses[:, :66]
+        poses_np = np.asarray(data["poses"], dtype=np.float32)
+        trans_np = np.asarray(data["trans"], dtype=np.float32)
 
-        factor = int(round(fps / TARGET_FPS))
-        factor = max(1, factor)
-        pose_body = downsample(pose_body, factor)
-        trans = downsample(trans, factor)
+        T_src = min(poses_np.shape[0], trans_np.shape[0])
+        pose_body_np = poses_np[:T_src, :66]
+        trans_np = trans_np[:T_src]
 
-        T = min(pose_body.shape[0], trans.shape[0])
-        pose_body = pose_body[:T]
-        trans = trans[:T]
+        pose_body_np, trans_np = resample_motion(
+            pose_body_np, trans_np, fps, TARGET_FPS
+        )
+
+        pose_body = torch.from_numpy(np.ascontiguousarray(pose_body_np)).float()
+        trans = torch.from_numpy(np.ascontiguousarray(trans_np)).float()
+
+        T = pose_body.shape[0]
 
         global_orient = pose_body[:, :3]
         body_pose = pose_body[:, 3:]
@@ -176,15 +194,32 @@ def process_file(npz_path: Path):
             model, trans, global_orient, body_pose, betas, chunk_size=MAX_BATCH_SIZE
         )
         joints = joints.cpu().numpy()
-        
+
         joints = joints @ R_Z_TO_Y.T
         root_pos = joints[:, 0, :]
 
+        with torch.no_grad():
+            rest_out = model(
+                transl=torch.zeros(1, 3, device=DEVICE),
+                global_orient=torch.zeros(1, 3, device=DEVICE),
+                body_pose=torch.zeros(1, 63, device=DEVICE),
+                left_hand_pose=torch.zeros(1, 45, device=DEVICE),
+                right_hand_pose=torch.zeros(1, 45, device=DEVICE),
+                betas=betas,
+            )
+        rest_joints = rest_out.joints[0, :JOINTS_TO_KEEP, :].cpu().numpy() @ R_Z_TO_Y.T
+
         return {
-            "poses": joint_rotmats_flat,   
-            "trans": root_pos,             
+            "poses": joint_rotmats_flat,
+            "trans": root_pos,
+            "rest_joints": rest_joints.astype(np.float32),
             "betas": betas_np,
-            "gender": gender
+            "gender": gender,
+            "fps": np.int32(TARGET_FPS),
+            "src_fps": np.int32(fps),
+            "subset": npz_path.parents[1].name,
+            "subject_id": npz_path.parents[0].name,
+            "sequence_id": npz_path.stem.replace("_poses", ""),
         }
 
     except Exception as e:
@@ -196,15 +231,36 @@ def save_npz(out_path: Path, data_dict: dict):
     np.savez_compressed(out_path, **data_dict)
 
 
-pose_files = list(IN_DIR.rglob("*_poses.npz"))
-print(f"Total: {len(pose_files)} pose files")
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-for path in tqdm(pose_files):
-    result = process_file(path)
-    if result is not None:
-        dataset = path.parents[1].name
-        stem = path.stem.replace("_poses", "")
-        out_path = OUT_DIR / f"{dataset}_{stem}.npz"
-        save_npz(out_path, result)
+    pose_files = list(IN_DIR.rglob("*_poses.npz"))
+    print(f"Total: {len(pose_files)} pose files")
 
-print(f"Files saved to {OUT_DIR}")
+    written = {}
+    collisions = 0
+    skipped = 0
+
+    for path in tqdm(pose_files):
+        result = process_file(path)
+        if result is None:
+            skipped += 1
+            continue
+
+        out_name = (
+            f"{result['subset']}_{result['subject_id']}_{result['sequence_id']}.npz"
+        )
+        if out_name in written:
+            collisions += 1
+            print(f"COLLISION: {out_name} already written by {written[out_name]}")
+        written[out_name] = str(path)
+
+        save_npz(OUT_DIR / out_name, result)
+
+    print(f"\nWrote {len(written)} files to {OUT_DIR}")
+    print(f"Skipped (unreadable): {skipped}")
+    print(f"Name collisions:      {collisions}")
+
+
+if __name__ == "__main__":
+    main()
