@@ -5,6 +5,8 @@ from torch.utils.data import Dataset
 from collections import OrderedDict
 
 class AMASSForecastDataset(Dataset):
+    _warned_missing_rest = False
+
     def __init__(self, split_file, input_frames=8, output_frames=16, stride=1, min_length=None, normalize_orientation=True, cache_max_items=256):
         
         self.paths = [Path(line.strip()) for line in Path(split_file).read_text().splitlines()]
@@ -39,16 +41,25 @@ class AMASSForecastDataset(Dataset):
             self._cache.move_to_end(key)
             return self._cache[key]
         data = np.load(path, allow_pickle=True)
-        poses = data["poses"].astype(np.float32, copy=False)  
-        trans = data["trans"].astype(np.float32, copy=False)  
-        self._cache[key] = (poses, trans)
+        poses = data["poses"].astype(np.float32, copy=False)
+        trans = data["trans"].astype(np.float32, copy=False)
+        if "rest_joints" in data:
+            rest = data["rest_joints"].astype(np.float32, copy=False)
+        else:
+            if not AMASSForecastDataset._warned_missing_rest:
+                AMASSForecastDataset._warned_missing_rest = True
+                print(
+                    f"\n WARNING: {path} has no 'rest_joints'."
+                )
+            rest = np.zeros((22, 3), dtype=np.float32)
+        self._cache[key] = (poses, trans, rest)
         if len(self._cache) > self.cache_max_items:
             self._cache.popitem(last=False)
-        return poses, trans
+        return poses, trans, rest
 
     def __getitem__(self, idx):
         path, t = self.samples[idx]
-        poses, trans = self._load_cached(path)
+        poses, trans, rest = self._load_cached(path)
 
         pose_clip = poses[t:t + self.total_len].copy()   
         trans_clip = trans[t:t + self.total_len].copy()   
@@ -67,8 +78,7 @@ class AMASSForecastDataset(Dataset):
             trans_clip = trans_clip - trans_clip[0:1]
             
             pose_clip_3x3 = pose_clip.reshape(-1, 22, 3, 3)
-            R_yaw_exp = R_yaw[None, None, :, :]  
-            pose_clip_3x3 = R_yaw_exp @ pose_clip_3x3
+            pose_clip_3x3[:, 0] = R_yaw @ pose_clip_3x3[:, 0]
             pose_clip = pose_clip_3x3.reshape(-1, 22, 9)
 
         root_traj = trans_clip 
@@ -82,7 +92,8 @@ class AMASSForecastDataset(Dataset):
             "past_pose": torch.from_numpy(past_pose),
             "future_pose": torch.from_numpy(future_pose),
             "past_root": torch.from_numpy(past_root),
-            "future_root": torch.from_numpy(future_root)
+            "future_root": torch.from_numpy(future_root),
+            "rest_joints": torch.from_numpy(rest.copy()),
         }
 
 
